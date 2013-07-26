@@ -1,4 +1,4 @@
-ice-exchange
+icecast-soundexchange
 ============
 
-Simple script to convert Iceast audio stream logs to NPR SoundExchange format
+A simple script to convert Iceast audio stream logs to NPR-mandated SoundExchange format.
