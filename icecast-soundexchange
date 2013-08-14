@@ -1,0 +1,247 @@
+#!/usr/bin/env perl
+
+use strict;
+no strict "refs";
+
+use Data::Dumper;
+use Time::Local;
+use Time::Piece;
+use Date::Parse;
+
+use Getopt::Long;
+Getopt::Long::Configure ( "bundling" );
+use Pod::Usage;
+
+use constant ICECASTLOGDIR => $ENV{ICECASTLOGDIR} || q(/usr/share/icecast/log);
+use constant OUTPUTDIR => $ENV{OUTPUTDIR} || q(/var/tmp);
+use constant MOUNTPOINTS => ( 'high', 'low', 'driftless' );
+
+sub mon ( $$ );
+sub main ();
+
+main;
+1;
+
+sub main () {
+
+    my $retVal = undef;
+
+    my ( $result, $inputFile, $startDate, $endDate, $outputDir, $verbose, $debug, $help, $man ) = ( 0, 0, 0, 0, 0, 0, 0, 0, 0 );
+
+    my ( @logContents ) = ();
+
+    $result = GetOptions (
+	"input-file|i=s" => \$inputFile,
+	"start-date|s=s" => \$startDate,
+	"end-date|e=s" => \$endDate,
+	"output-dir|o=s" => \$outputDir,
+	"verbose|v" => \$verbose,
+	"debug|d+" => \$debug,
+	"help|h" => \$help,
+	"man|m" => \$man,
+	);
+    die "GetOptions returned " . $result . ". Stopped" if ( ! $result );
+
+    pod2usage ( 1 )             if ( defined ( $help ) && $help );
+    pod2usage ( -verbose => 2 ) if ( defined ( $man ) && $man );
+
+    $verbose = $debug;
+
+    if ( $startDate && $endDate ) {
+
+	my $start = str2time( $startDate, 'CST' );
+	my $end = str2time( $endDate, 'CST' );
+
+	print STDERR "Start date: ", $startDate, ": ", $start, ", End date: ", $endDate, ": ", $end, "\n" if ( $verbose );
+
+	$inputFile = $inputFile || ICECASTLOGDIR . q(/access.log);
+
+	if ( -f $inputFile ) {
+	    $outputDir = $outputDir || OUTPUTDIR;
+
+	    open( LOG, $inputFile ) || die "Cannot open $inputFile for reading. Stopped";
+	    @logContents = <LOG>;
+	    close( LOG );
+	    # chomp( @logContents );
+
+	    my ( @high ) = ();
+	    my ( @low ) = ();
+	    my ( @driftless ) = ();
+
+	    # print STDERR Dumper @logContents if ( $verbose );
+#207.190.123.196 - - [05/Mar/2013:22:09:36 -0600] "GET /high HTTP/1.0" 200 134755 "-" "WinampMPEG/5.63, Ultravox/2.1" 4
+#166.228.136.249 - - [05/Mar/2013:22:11:55 -0600] "GET /high HTTP/1.1" 200 1002080 "-" "BREW-Applet/0x010950A6 (BREW/3.1.5.189; DeviceId:  1388; Lang: en)" 92
+
+	    foreach my $logLine ( @logContents ) {
+		next unless ( $logLine =~ m#get\s+/(driftless\.ogg|high|low)\s+#i );
+		print STDERR $logLine if ( $debug > 1 );
+
+		if ( $logLine =~ m#^(\d+\.\d+\.\d+\.\d+)\s+-\s+-\s+\[(\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2})\s+-(0[56])00\]\s+"get\s+/(driftless\.ogg|high|low) http/\d\.\d"\s+(\d{3})\s+(\d+)\s+"([^"]+)"\s+"(.*)"\s+(\d+)$#i ) {
+		    my $ipAddress = $1;
+		    my ( $date, $hour, $minute, $second ) = split( /:/, $2);
+		    my $tzOffset = $3;
+		    my $mountPoint = $4;
+		    my $statusCode = $5;
+		    my $byteCount = $6;
+		    my $referer = $7;
+		    my $client = $8;
+		    my $duration = $9;
+		    my ( $mday, $mon, $year ) = split( /\//, $date );
+
+		    # print STDERR "ipAddress: $ipAddress - client: $client\n" if ($debug);
+
+		    # this time is actually the time the user disconnected
+		    # from the stream. We need to calculate the time at
+		    # which they connected to the stream by subtracting
+		    # the duration from this 'end time'
+		    my $time = timelocal( $second, $minute, $hour, $mday, mon( $mon, $verbose ), $year );
+		    $time -= $duration;
+
+		    next unless ( $start <= $time && $time <= $end );
+
+		    # my $connectTime = localtime( $time );
+		    my $connectTime = gmtime( $time );
+
+		    print STDERR
+			$ipAddress, " ",
+			$connectTime->ymd, " ",
+			$connectTime->hms, " ",
+			$mountPoint, " ", $duration, " ", $statusCode,
+			" ->", $referer, "<- ->", $client, "<-\n"
+			if ( $verbose);
+
+		    my $entry = sprintf
+			"%s\t%s\t%s\t%s\t%d\t%03d\t%s/%s",
+			$ipAddress,
+			$connectTime->ymd,
+			$connectTime->hms,
+			$mountPoint,
+			$duration,
+			$statusCode,
+			$referer,
+			$client
+			;
+
+		    $mountPoint =~ s/driftless\.ogg/driftless/;
+
+		    # collect the entries per-mountpoint
+		    push( @$mountPoint, $entry );
+		} else {
+		    print STDERR "Regex match failed for logLine:\n", $logLine;
+		}
+	    }
+
+	    # write per-mountpoint files with all collected entries
+	    for my $mount ( MOUNTPOINTS ) {
+		open( OUT, ">", "$outputDir/$mount.txt" ) || die "Cannot open $outputDir/$mount.txt for writing ($!). Stopped";
+		foreach my $line ( @$mount ) {
+		    print OUT $line, "\r\n";
+		}
+		close( OUT );
+	    }
+
+	} else {
+	    print STDERR "Cannot read file ", $inputFile, ". I quit.\n";
+	}
+    } else {
+	print STDERR "Please specify a starting date and an ending date for this report.\n";
+    }
+}
+
+sub mon ( $$ ) {
+    my $monthName = shift;
+    my $verbose = shift;
+
+    my $months = {
+	Jan => 0,
+	Feb => 1,
+	Mar => 2,
+	Apr => 3,
+	May => 4,
+	Jun => 5,
+	Jul => 6,
+	Aug => 7,
+	Sep => 8,
+	Oct => 9,
+	Nov => 10,
+	Dec => 11,
+	};
+
+    $months->{$monthName};
+}
+
+__END__;
+
+=head1 NAME
+
+B<icecast-soundexchange> - munge icecast logs into NPR soundexchange format
+
+=head1 SYNOPSIS
+
+icecast-soundexchange [ --help ] [ --man ] [ --debug ] [ --verbose ] \
+                   [ --input-file <input-file> ] \
+                   --start-date <start-date> --end-date <end-date>
+
+=head1 DESCRIPTION
+
+B<icecast-soundexchange> reads icecast access log files and writes
+tab-separated fields into (DOS-format) text files, one per icecast
+mount-point.
+
+See
+http://digitalservices.npr.org/post/soundexchange-streaming-file-format-standard-announced
+for details of the file format.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--help (-h)>
+
+show a brief usage message
+
+=item B<--man (-m)>
+
+show the complete manual page for this command
+
+=item B<--debug (-d)>
+
+launch B<icecast-soundexchange> in verbose debugging mode. Specify
+multiple times for more debugging.
+
+=item B<--verbose (-v)>
+
+launch B<icecast-soundexchange> in verbose mode (not quite as verbose as B<--debug>)
+
+=item B<--start-date (-s) E<lt>start-dateE<gt>>
+
+(required) specify the starting date for the log messages
+
+=item B<--end-date (-e) E<lt>end-dateE<gt>>
+
+(required) specify the ending date for the log messages
+
+=item B<--input-file (-i) E<lt>log-file-name<gt>>
+
+name the input icecast log file, B<access.log> is the default name
+
+=item B<--output-dir (-o) E<lt>directory-name<gt>>
+
+name the output directory for the per-mountpoint NPR-format files.
+The default is in the perl constant OUTPUTDIR (/var/tmp).
+
+=back
+
+=head1 SEE ALSO
+
+=over 8
+
+=item perl(1)
+
+=item icecast(1)
+
+=item http://digitalservices.npr.org/post/soundexchange-streaming-file-format-standard-announced
+
+=back
+
+=cut
